@@ -1,26 +1,19 @@
-from audioop import reverse
-from dataclasses import dataclass
-from dis import show_code
 from functools import total_ordering
-import itertools
 
 import copy
-
-import getpass
-import urllib.parse
-
-import psycopg2
 
 import datetime
 import pytz
 import calendar
 
 from math import floor, ceil
+import math
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+from sklearn.neighbors import NearestNeighbors
 
 import seaborn as sns
 
@@ -101,6 +94,9 @@ class transformer:
                         start_date (str or datetime object): start date of range to consider.
                         end_date (str or datetime object): end date of range to consider.
 
+
+                    Returns: dataframe containing the transformer loads. Note that this is also saved to
+                        self.capacity_data.
                     
 
             Will only recompute data if the needed data has not been queried before.
@@ -219,6 +215,8 @@ class transformer:
                                                                          
                          start_date (str): start date of time series range
                          end_date (str): end date of time series range
+
+                Returns: dataframe with the aggregate loads from the listed meters.
     
         '''
     
@@ -296,12 +294,15 @@ class transformer:
             number of each type of charger used specified.
 
                     Parameters:
-                            ch_prop_pairs: pairs of chargers and percentages (charger, %)
+                            ch_prop_pairs (List of tuples): pairs of chargers and percentages (charger, %)
             
+                    Returns: dataframe with fitted number of chargers at each timestamp where the transformer
+                             has load data.
 
             The number of chargers is calculated by noting that if we have n chargers total, then our total
                 power draw is (charger1_power*charger1_weight + ... + chargerk_power*chargerk_weight)*n
-                which is equivalent to fitting one charger with power draw (charger1_power*charger1_weight + ... + chargerk_power*chargerk_weight).
+                which is equivalent to fitting one charger with power draw (charger1_power*charger1_weight + 
+                ... + chargerk_power*chargerk_weight).
             
         '''
 
@@ -344,10 +345,16 @@ class transformer:
             power of pulled by each type of charger used specified.
 
                     Parameters:
-                            ch_prop_pairs: pairs of chargers and percentages (charger, %)
+                            ch_prop_pairs (List of tuples): pairs of chargers and percentages (charger, %)
                                             percentage is the percentage of total budget
             
-            
+                    Returns: dataframe with fitted number of chargers at each timestamp where the transformer
+                             has load data.
+
+            The fit is determined by creating a virtual transformer for each charger to fit on, with that virtual
+                transformer's available capacity equal to the real transformer's available capactiy multiplied by
+                the proportion of that capacity available for the associated charger. Note that the proportions
+                of power allocated will not necessarily be exactly the proportions specified.
         '''
 
         if type(ch_prop_pairs[-1]) is not tuple:
@@ -396,44 +403,60 @@ class transformer:
 
         return charger_data.copy(deep = True)        
 
-
-    
-
-    def fit_full_onetime(excess_load, chargers, max_number):
+    def fit_full_onetime(chargers: list, capacity: float, min_chargers=1, max_chargers=100, number_of_solutions = 1):
         
-        '''given a list of EV charger powers (in kWh), the function will return the 'near' optimal distribution
-            of numbers of each charger type for the given excess load
-                parameters: chargers(list): A list of chargers (power in kWh)
-                            excess_load(float): excess load on a transformer
-                            percent(float): percent of the load that we are allowed to assign to EV chargers
-                returns: a tuple of int whose i-th entry is the number of chargers of i-th type. 
+        '''Determines the distribution of chargers to approximately maximize power usage using
+            a specified list of chargers, within a range of an allowed number of chargers to install.
+
+            Note that this is not deterministic. This attempts to find an optimal distribution in
+            a random way, so the distribution obtained may not be the strictly optimal solution
+            in terms of power usage.
+
+                    Parameters: 
+                            chargers (List): A list of chargers
+                            capacity (float): avaiable capacity on a transformer
+                            min_chargers (int): minimum number of chargers to fit on transformer
+                            max_chargers (int): maximum number of chargers to fit on transformer
+                            number_of_solutions (int): number of near optimal solutions to return
+                
+                    Returns: a list of integers whose i-th entry is the number of chargers of i-th type. 
         '''
-        chargers.sort(reverse = True)
+
+        low = min_chargers
+        high = [math.ceil(capacity/ch.power) for ch in chargers]
+        if sum(high)>max_chargers:
+            high = max_chargers
+
+        num = math.prod(high)
+
+        vecs = np.random.randint(low, high, (num,3))   # random initialization (gives 'near' optimal answers)
+        vecs_list = [vec for vec in vecs if np.array([ch.power for ch in chargers]).dot(vec) <= capacity]
+
+        maxnorm = max([np.linalg.norm(v) for v in vecs_list])
+        vecs_trans = []
+        for v in vecs:
+            vecs_trans.append(np.insert(v, 0, np.sqrt(maxnorm**2-np.linalg.norm(v)**2)))  #add (maxnorm^2 - |v|^2)^0.5 in the zeroth position in v
         
-        lower_bound = excess_load * 0.8       # atleast utilize 80% of the excess load
-        set_ = [str(i) for i in range(ceil(excess_load/chargers[-1].power))]
-        combinations = [tuples for tuples in itertools.product(set_, repeat = len(chargers))]
-        func = lambda x: tuple(int(i) for i in x)
-        combinations_int = tuple(func(i) for i in combinations)
-        set_of_seq = []
-        for x in combinations_int:
-            if lower_bound <= np.sum(np.array(x) * np.array([ch.power for ch in chargers])) <= excess_load:
-                set_of_seq.append(x)
-        for i in range(len(set_of_seq)-1, -1, -1):
-            if sum(set_of_seq[i]) > max_number:
-                set_of_seq.remove(set_of_seq[i])
-        prod_of_seq = np.array(set_of_seq)*np.array([ch.power for ch in chargers])
-        sum_of_seq = []
-        for i in range(len(prod_of_seq)):
-            sum_of_seq.append(sum(prod_of_seq[i]))
-        # return set_of_seq
-        return set_of_seq[np.argmax(sum_of_seq)]
+
+        q = np.array([ch.power for ch in chargers])
+        q_trans = np.insert(q, 0, 0)                                      #add 0 in the 0-th position of q
+
+        X = np.array(vecs_trans)
+        nbrs = NearestNeighbors(n_neighbors = number_of_solutions, algorithm='kd_tree').fit(X)       # we can set the nearest neighbours to any number we want if we want a few closest answers
+
+        distances, indices = nbrs.kneighbors(np.array([q_trans]))
+
+        return list(map(lambda j: vecs_list[j], indices[0:number_of_solutions]))
     
     def fit_EVC(self, ch):
         '''Determines the number of electric vehicle chargers, with the given parameters, fit within excess capacity
             on the specified transformer on an hourly basis.
             
-            
+                    Parameters:
+                        ch (charger): charger to fit onto transformer
+
+                    Returns: dataframe containing number of chargers the transformer can fit at each timestamp
+                        where the transformer has load data.
         '''
         
         charger_power = ch.power
@@ -566,7 +589,7 @@ class transformer:
         plt.show()
         
 
-    def graph_power_scenarios(self, ch_prop_pairs, ax = None, show_power = True, prop = 'num'):
+    def graph_power_scenarios(self, ch_prop_pairs, ax = None, show_power = True, mode = 'num'):
         '''Graphs the charger distribution within the budgeted capacity for four scenarios:
             - chargers never surpass budget
             - chargers never surpass budget during the night
@@ -581,15 +604,16 @@ class transformer:
                                 which indicates what percentage of the total chargers should be of the matching type.
                             - ax: matplotlib axis, only used if show_power = False
                             - show_power (bool): flag to determine if the capacity graph is shown alongside the charger distribution.   
-                            - prop (str): determine the measure of the charger proportions
-                                            - if prop = 'num', the chargers are fit to be proportional with the total number of chargers
-                                            - if prop = 'pow', the chargers are fit to be proportional with the total power draw, where
+                            - mode (str): determine the fitting mode for the chargers
+                                            - if mode = 'num', the chargers are fit to be proportional with the total number of chargers
+                                            - if mode = 'pow', the chargers are fit to be proportional with the total power draw, where
                                                     the percentage given is treated as a maximum proportion of the budgeted capacity for that charger.
+                                            - if mode = 'optimal',
             
         '''
 
-        if (prop != 'num') and (prop != 'pow'):
-            raise Exception('Proportion measure, prop, must be either \'num\' or \'pow\'.')
+        if (mode != 'num') and (mode != 'pow') and (mode != 'optimal'):
+            raise Exception('Proportion measure, prop, must be either \'num\', \'pow\', or \'optimal\'.')
         
         charger_data = None
 
@@ -597,145 +621,286 @@ class transformer:
         if len(ch_prop_pairs) > 1:
             ch_prop_pairs.sort(key = lambda y: y[0], reverse = True)
 
-        if prop == 'num':
+        if mode == 'num':
             charger_data = self.fit_ch_num_proportional(ch_prop_pairs)        
-        if prop == 'pow':
+        if mode == 'pow':
             charger_data = self.fit_ch_pow_proportional(ch_prop_pairs)    
 
+        if mode == 'num' or mode == 'pow':
+            if charger_data is None:
+                raise Exception('Error occured while fitting chargers to transformer: charger_data was returned as None.')    
 
-        if charger_data is None:
-            raise Exception('Error occured while fitting chargers to transformer: charger_data was returned as None.')    
-
-        charger_data = transformer.parse_date_time(charger_data).drop(['year', 'day', 'weekday'], axis = 1)
-        
-        
-        hourly_min = charger_data.drop('month', axis = 1).groupby(by = 'hour').min()
-        summer_hourly_min = charger_data[(charger_data['month'] >= 6) & (charger_data['month'] <= 9)] \
-                                        .drop('month', axis = 1) \
-                                        .groupby(by = 'hour').min()
-        
-        
-        charger_data['date'] = charger_data.index.date
-        charger_data = charger_data.drop(['month'], axis = 1)
-        
-        
-        total_min = hourly_min.min()
-        nightly_min = hourly_min[(hourly_min.index <= 4) | (hourly_min.index >= 22)].min()
-        summer_total_min = summer_hourly_min.min()
-        summer_nightly_min = summer_hourly_min[(hourly_min.index <= 6) | (hourly_min.index >= 22)].min()
-        
-
-        #Setup dataframe for charger count graph
-        
-
-        df = pd.DataFrame(total_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02)), columns = ['All time'])
-        df['Nightly'] = nightly_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02))
-        df['All summer'] = summer_total_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02))
-        df['Summer nightly'] = summer_nightly_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02 ))
-
-        df = df.transpose()
-
-        #Setup dataframe for power graph
-        if show_power is True:
-            budget_df = pd.DataFrame(total_min,
-                                        columns = ['All time'])
-
-
-            budget_df['Nightly'] = nightly_min
-            budget_df['All summer'] = summer_total_min
-            budget_df['Summer nightly'] = summer_nightly_min
-
-
-            budget_df = budget_df.transpose()
-
-            for col in budget_df.columns:
-                if col[0:7] == 'Charger':
-                    power = float(col.split()[2][:-2])
-                
-                    budget_df[col] = budget_df[col]*power
+            charger_data = transformer.parse_date_time(charger_data).drop(['year', 'day', 'weekday'], axis = 1)
             
-            budget_df['Leftover Available Capacity'] = budget_df['Budgeted Capacity'] - budget_df['Used Capacity']
-            budget_df = budget_df.drop(['Budgeted Capacity', 'Used Capacity'], axis = 1)
+            
+            hourly_min = charger_data.drop('month', axis = 1).groupby(by = 'hour').min()
+            summer_hourly_min = charger_data[(charger_data['month'] >= 6) & (charger_data['month'] <= 9)] \
+                                            .drop('month', axis = 1) \
+                                            .groupby(by = 'hour').min()
+            
+            
+            charger_data['date'] = charger_data.index.date
+            charger_data = charger_data.drop(['month'], axis = 1)
+            
+            
+            total_min = hourly_min.min()
+            nightly_min = hourly_min[(hourly_min.index <= 4) | (hourly_min.index >= 22)].min()
+            summer_total_min = summer_hourly_min.min()
+            summer_nightly_min = summer_hourly_min[(summer_hourly_min.index <= 4) | (summer_hourly_min.index >= 22)].min()
+            
+
+            #Setup dataframe for charger count graph
+            
+
+            df = pd.DataFrame(total_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02)), columns = ['All time'])
+            df['Nightly'] = nightly_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02))
+            df['All summer'] = summer_total_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02))
+            df['Summer nightly'] = summer_nightly_min.drop(['Budgeted Capacity', 'Used Capacity'], axis = 0).apply(lambda x: max(x,0.02 ))
+
+            df = df.transpose()
+
+            #Setup dataframe for power graph
+            if show_power is True:
+                budget_df = pd.DataFrame(total_min,
+                                            columns = ['All time'])
+
+
+                budget_df['Nightly'] = nightly_min
+                budget_df['All summer'] = summer_total_min
+                budget_df['Summer nightly'] = summer_nightly_min
+
+
+                budget_df = budget_df.transpose()
+
+                for col in budget_df.columns:
+                    if col[0:7] == 'Charger':
+                        power = float(col.split()[2][:-2])
+                    
+                        budget_df[col] = budget_df[col]*power
+                
+                budget_df['Leftover Available Capacity'] = budget_df['Budgeted Capacity'] - budget_df['Used Capacity']
+                budget_df = budget_df.drop(['Budgeted Capacity', 'Used Capacity'], axis = 1)
 
 
 
-        # Graphing
+            # Graphing
 
-        if type(show_power) is not bool:
-            raise Exception('show_power flag must be a boolean.')
+            if type(show_power) is not bool:
+                raise Exception('show_power flag must be a boolean.')
 
-        if show_power is True:
-            fig, axs = plt.subplots(nrows = 1, ncols = 2, figsize = (14,6))
+            if show_power is True:
+                fig, axs = plt.subplots(nrows = 1, ncols = 2, figsize = (14,6))
 
-            ax1 = axs.flatten()[0]
-            ax2 = axs.flatten()[1]
+                ax1 = axs.flatten()[0]
+                ax2 = axs.flatten()[1]
 
-        else: 
-            if ax is None:
-                fig, axs = plt.subplots(nrows = 1, ncols = 1, figsize = (7,6))
+            else: 
+                if ax is None:
+                    fig, axs = plt.subplots(nrows = 1, ncols = 1, figsize = (7,6))
 
-                ax1 = axs
-            else:
-                ax1 = ax
-        
+                    ax1 = axs
+                else:
+                    ax1 = ax
+            
 
-        df.plot(kind = 'bar', stacked = True, ax = ax1)
+            df.plot(kind = 'bar', stacked = True, ax = ax1)
 
-        
-        if (np.sum([total_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
-            (np.sum([nightly_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
-            (np.sum([summer_total_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
-            (np.sum([summer_nightly_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3):
-            ax.set_yticks(ticks = [0,1,2,3])
+            
+            if (np.sum([total_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
+                (np.sum([nightly_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
+                (np.sum([summer_total_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
+                (np.sum([summer_nightly_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3):
+                ax.set_yticks(ticks = [0,1,2,3])
 
-        for c in ax1.containers:
-
-            # Optional: if the segment is small or 0, customize the labels
-            labels = [int(v.get_height()) if v.get_height() > 0.5 else '' for v in c]
-    
-            # remove the labels parameter if it's not needed for customized labels
-            ax1.bar_label(c, labels=labels, label_type='center')
-
-        charger_powers = [str(ch_prop_pairs[i][0].power) + ' kW' for i in range(0,len(ch_prop_pairs))]
-
-        ax1.legend(labels = charger_powers, loc='upper left', bbox_to_anchor=(1.02,0.95))
-        ax1.tick_params('x', labelrotation= 45, size = 17)
-        ax1.set_title(self.id, pad = 10, fontsize = 19)
-        ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
-        ax1.set_ylabel('Number of chargers', fontsize = 17)
-
-        if show_power is True:
-            budget_df.plot(kind = 'bar', stacked = True, ax = ax2)
-
-            for c in ax2.containers:
+            for c in ax1.containers:
 
                 # Optional: if the segment is small or 0, customize the labels
-                labels = [int(v.get_height()) if v.get_height() > 0 else '' for v in c]
+                labels = [int(v.get_height()) if v.get_height() > 0.5 else '' for v in c]
         
                 # remove the labels parameter if it's not needed for customized labels
-                ax2.bar_label(c, labels=labels, label_type='center')
-            
-                
-            ax1.set_title('Number of chargers', fontsize = 19)
-            ax2.legend(loc='upper left', bbox_to_anchor=(1.02,0.95))    
-            ax2.tick_params('x', labelrotation= 45, size = 17)
-            ax2.set_title('Power usage of chargers', fontsize = 19)
-            ax2.set_ylabel('Power usage (kW)', fontsize = 17)
+                ax1.bar_label(c, labels=labels, label_type='center')
 
-            fig.subplots_adjust(wspace = 0.6)
+            charger_powers = [str(ch_prop_pairs[i][0].power) + ' kW' for i in range(0,len(ch_prop_pairs))]
 
-            fig.suptitle('Chargers on transformer ' + self.id, fontsize = 22, x = 0.52, y = 1.05)
-        
+            ax1.legend(labels = charger_powers, loc='upper left', bbox_to_anchor=(1.02,0.95))
+            ax1.tick_params('x', labelrotation= 45, size = 17)
+            ax1.set_title(self.id, pad = 10, fontsize = 19)
+            ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
+            ax1.set_ylabel('Number of chargers', fontsize = 17)
 
-        # Assume that if an axis is being passed, then graph parameters may still need to be adjusted before calling plt.show().
-
-        if ax is None:
             if show_power is True:
-                plt.figtext(0.145,-0.17,'Night is assumed to be between 10pm and 4am.\nSummer is assumed to be between June and September.', fontsize= 15)
-            else:
-                plt.figtext(0.17,-0.17,'Night is assumed to be between 10pm and 4am.\nSummer is assumed to be between June and September.', fontsize = 15)
+                budget_df.plot(kind = 'bar', stacked = True, ax = ax2)
 
-            plt.show()
+                for c in ax2.containers:
+
+                    # Optional: if the segment is small or 0, customize the labels
+                    labels = [int(v.get_height()) if v.get_height() > 0 else '' for v in c]
+            
+                    # remove the labels parameter if it's not needed for customized labels
+                    ax2.bar_label(c, labels=labels, label_type='center')
+                
+                    
+                ax1.set_title('Number of chargers', fontsize = 19)
+                ax2.legend(loc='upper left', bbox_to_anchor=(1.02,0.95))    
+                ax2.tick_params('x', labelrotation= 45, size = 17)
+                ax2.set_title('Power usage of chargers', fontsize = 19)
+                ax2.set_ylabel('Power usage (kW)', fontsize = 17)
+
+                fig.subplots_adjust(wspace = 0.6)
+
+                fig.suptitle('Chargers on transformer ' + self.id, fontsize = 22, x = 0.52, y = 1.05)
+            
+
+            # Assume that if an axis is being passed, then graph parameters may still need to be adjusted before calling plt.show().
+
+            if ax is None:
+                if show_power is True:
+                    plt.figtext(0.145,-0.17,'Night is assumed to be between 10pm and 4am.\nSummer is assumed to be between June and September.', fontsize= 15)
+                else:
+                    plt.figtext(0.17,-0.17,'Night is assumed to be between 10pm and 4am.\nSummer is assumed to be between June and September.', fontsize = 15)
+
+                plt.show()
+
+        if mode == 'optimal':
+
+            charger_data = transformer.parse_date_time(self.capacity_Data.drop(['load', 'Excess Capacity'], axis = 1)).drop(['year', 'day', 'weekday'], axis = 1)
+            
+            
+            hourly_min = charger_data.drop('month', axis = 1).groupby(by = 'hour').min()
+            summer_hourly_min = charger_data[(charger_data['month'] >= 6) & (charger_data['month'] <= 9)] \
+                                            .drop('month', axis = 1) \
+                                            .groupby(by = 'hour').min()
+            
+            
+            charger_data['date'] = charger_data.index.date
+            charger_data = charger_data.drop(['month'], axis = 1)
+            
+            
+            total_min = hourly_min.min()[0]
+            nightly_min = hourly_min[(hourly_min.index <= 4) | (hourly_min.index >= 22)].min()[0]
+            summer_total_min = summer_hourly_min.min()[0]
+            summer_nightly_min = summer_hourly_min[(summer_hourly_min.index <= 4) | (summer_hourly_min.index >= 22)].min()[0]
+
+            chargers = []
+            for ch in ch_prop_pairs:
+                try:
+                    iterator = iter(ch)
+                except TypeError:
+                    chargers.append(ch)
+                else:
+                    chargers.append(ch[0])
+
+            total_fit = transformer.fit_full_onetime(chargers, total_min)
+            nightly_fit = transformer.fit_full_onetime(chargers, nightly_min)
+            summer_fit = transformer.fit_full_onetime(chargers, summer_total_min)
+            summer_nightly_fit = transformer.fit_full_onetime(chargers, summer_nightly_min)
+
+            df = pd.DataFrame.from_dict({0:(total_fit, nightly_fit, summer_fit, summer_nightly_fit)}, orient = 'index',
+                                        columns = ['All Time', 'Nightly', 'Summer', 'Summer Nightly']).transpose()
+
+            #Setup dataframe for power graph
+            if show_power is True:
+                budget_df = pd.DataFrame([total_min],
+                                            columns = ['All time'])
+
+
+                budget_df['Nightly'] = nightly_min[0]
+                budget_df['All summer'] = summer_total_min[0]
+                budget_df['Summer nightly'] = summer_nightly_min[0]
+
+
+                budget_df = budget_df.transpose()
+
+                for col in budget_df.columns:
+                    if col[0:7] == 'Charger':
+                        power = float(col.split()[2][:-2])
+                    
+                        budget_df[col] = budget_df[col]*power
+                
+                budget_df['Leftover Available Capacity'] = budget_df['Budgeted Capacity'] - budget_df['Used Capacity']
+                budget_df = budget_df.drop(['Budgeted Capacity', 'Used Capacity'], axis = 1)
+
+
+
+            # Graphing
+
+            if type(show_power) is not bool:
+                raise Exception('show_power flag must be a boolean.')
+
+            if show_power is True:
+                fig, axs = plt.subplots(nrows = 1, ncols = 2, figsize = (14,6))
+
+                ax1 = axs.flatten()[0]
+                ax2 = axs.flatten()[1]
+
+            else: 
+                if ax is None:
+                    fig, axs = plt.subplots(nrows = 1, ncols = 1, figsize = (7,6))
+
+                    ax1 = axs
+                else:
+                    ax1 = ax
+            
+
+            df.plot(kind = 'bar', stacked = True, ax = ax1)
+
+            
+            if (np.sum([total_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
+                (np.sum([nightly_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
+                (np.sum([summer_total_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3) and \
+                (np.sum([summer_nightly_min[i] for i in range(1,len(ch_prop_pairs)+1)]) < 3):
+                ax.set_yticks(ticks = [0,1,2,3])
+
+            for c in ax1.containers:
+
+                # Optional: if the segment is small or 0, customize the labels
+                labels = [int(v.get_height()) if v.get_height() > 0.5 else '' for v in c]
+        
+                # remove the labels parameter if it's not needed for customized labels
+                ax1.bar_label(c, labels=labels, label_type='center')
+
+            charger_powers = [str(ch_prop_pairs[i][0].power) + ' kW' for i in range(0,len(ch_prop_pairs))]
+
+            ax1.legend(labels = charger_powers, loc='upper left', bbox_to_anchor=(1.02,0.95))
+            ax1.tick_params('x', labelrotation= 45, size = 17)
+            ax1.set_title(self.id, pad = 10, fontsize = 19)
+            ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
+            ax1.set_ylabel('Number of chargers', fontsize = 17)
+
+            if show_power is True:
+                budget_df.plot(kind = 'bar', stacked = True, ax = ax2)
+
+                for c in ax2.containers:
+
+                    # Optional: if the segment is small or 0, customize the labels
+                    labels = [int(v.get_height()) if v.get_height() > 0 else '' for v in c]
+            
+                    # remove the labels parameter if it's not needed for customized labels
+                    ax2.bar_label(c, labels=labels, label_type='center')
+                
+                    
+                ax1.set_title('Number of chargers', fontsize = 19)
+                ax2.legend(loc='upper left', bbox_to_anchor=(1.02,0.95))    
+                ax2.tick_params('x', labelrotation= 45, size = 17)
+                ax2.set_title('Power usage of chargers', fontsize = 19)
+                ax2.set_ylabel('Power usage (kW)', fontsize = 17)
+
+                fig.subplots_adjust(wspace = 0.6)
+
+                fig.suptitle('Chargers on transformer ' + self.id, fontsize = 22, x = 0.52, y = 1.05)
+            
+
+            # Assume that if an axis is being passed, then graph parameters may still need to be adjusted before calling plt.show().
+
+            if ax is None:
+                if show_power is True:
+                    plt.figtext(0.145,-0.17,'Night is assumed to be between 10pm and 4am.\nSummer is assumed to be between June and September.', fontsize= 15)
+                else:
+                    plt.figtext(0.17,-0.17,'Night is assumed to be between 10pm and 4am.\nSummer is assumed to be between June and September.', fontsize = 15)
+
+                plt.show()
+
+
 
     def graph_capacity_with_chargers(self, ch_prop_pairs):
         
